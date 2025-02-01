@@ -1,0 +1,46 @@
+# ESP-IDF specific build files
+build/
+*.bin
+*.elf
+*.map
+*.hex
+*.ota_data
+*.a
+
+# Logs and debugging files
+*.log
+*.gdb
+*.gdbinit
+
+# CMake specific
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Backup sdk configuration files
+sdkconfig.old
+
+# Python environment files
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Tools and system files
+*.swp
+*.swo
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db
+*.~
+
+# Generated components and libraries
+components/*/build/
+components/*/*.a
+components/*/CMakeFiles/
+components/*/cmake_install.cmake
+components/*/Makefile
