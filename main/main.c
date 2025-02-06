@@ -1,13 +1,17 @@
 #include <time.h>
 #include <nvs_flash.h>
 #include <esp_log.h>
+#include <esp_now.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+
 #include "pb_encode.h"
 #include "pb_decode.h"
 #include "messages.pb.h"
 #include "wireless.h"
-#include "esp_system.h"
 
-#include <esp_now.h>
 #include "comm.h"
 
 #define WIFI_SSID      "lijilin_2.4G"
@@ -131,16 +135,13 @@ void app_main(void)
 {
     // Initialize NVS for wifi station mode
     nvs_init();
-    // Init WiFi to station mode in order to sync time
-    wifi_sta_init(WIFI_SSID, WIFI_PASS);
-    // Deinit WiFi
-    wifi_shutdown();
     // Swith WiFi to ESPNOW mode
     wifi_espnow_init();
-
     // Initialize ESPNOW
     comm_init();
+    add_peer(BROADCAST_MAC_ADDR, false);
     register_message_handler(task_handler);
+
 
     // Get current time
     time_t now;
@@ -156,16 +157,19 @@ void app_main(void)
 
     // Broadcast sensor mac address
     uint8_t mac[6];
-    esp_err_t ret = esp_efuse_mac_get_default(mac);
+    esp_err_t ret = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to get MAC address");
         return;
     }
     // Broadcast the MAC address for 60 seconds
     for(uint i = 0; i < 60; i++) {
+        ESP_LOGI(TAG, "Broadcasting MAC address...");
         broadcast(mac, ESP_NOW_ETH_ALEN);
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
+
+    // TODO: grab the time
 
     // // Create a sensor query message
     // SensorQuery query = SensorQuery_init_zero;
