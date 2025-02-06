@@ -1,0 +1,15 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Proto",
+      "type": "shell",
+      "command": "${workspaceFolder}/components/mist_messages/scripts/proto_compile.sh",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "detail": "This task runs the proto_compile.sh script to compile .proto files."
+    }
+  ]
+}

@@ -44,3 +44,5 @@ components/*/*.a
 components/*/CMakeFiles/
 components/*/cmake_install.cmake
 components/*/Makefile
+
+managed_components
