@@ -69,10 +69,31 @@ static void handle_command(const Command* cmd) {
     }
 }
 
+// Record the timestamp when sending the request
+// So when master sends back the timestamp, we can calculate the time difference to adjust the slave time.
+static int64_t s_sending_timestamp = 0;
+
+// Start time sync with master
+static esp_err_t start_time_sync(const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN]) {
+    ESP_LOGI(TAG, "Requesting master timestamp...");
+    SyncTime time_sync = SyncTime_init_default;
+    size_t buffer_size = 0;
+    if (!pb_get_encoded_size(&buffer_size, SyncTime_fields, &time_sync)) {
+        ESP_LOGE(TAG, "Failed to get encoded size");
+        return ESP_FAIL;
+    }
+    uint8_t buffer[buffer_size];
+    pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
+    if (!pb_encode(&stream, SyncTime_fields, &time_sync)) {
+        ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
+        return ESP_FAIL;
+    }
+
+    s_sending_timestamp = time(NULL);
+    return comm_send(buffer, buffer_size, master_mac_addr);
+}
+
 static bool recv_msg_cb(const CommTask_t* task) {
-    // For time sync
-    static int64_t sending_timestamp = 0;
-    
     pb_istream_t stream = pb_istream_from_buffer(task->buffer, task->buffer_size);
     
     // In Protocol Buffers, each field is prefixed with a tag that contains two pieces of information:
@@ -99,7 +120,7 @@ static bool recv_msg_cb(const CommTask_t* task) {
 
     switch (message_type) {
         case MessageType_SENSOR_QUERY: {
-            SensorQuery query = SensorQuery_init_zero;
+            SensorQuery query = SensorQuery_init_default;
             if (pb_decode(&stream, SensorQuery_fields, &query)) {
                 handle_sensor_query(&query);
             } else {
@@ -109,7 +130,7 @@ static bool recv_msg_cb(const CommTask_t* task) {
             break;
         }
         case MessageType_COMMAND: {
-            Command cmd = Command_init_zero;
+            Command cmd = Command_init_default;
             if (pb_decode(&stream, &Command_msg, &cmd)) {
                 handle_command(&cmd);
             } else {
@@ -120,12 +141,15 @@ static bool recv_msg_cb(const CommTask_t* task) {
         }
         // Received master MAC address from broadcast
         case MessageType_SLAVERY_HANDSHAKE: {
-            SlaveryHandshake handshake = SlaveryHandshake_init_zero;
-            handshake.message_type = MessageType_SLAVERY_HANDSHAKE;
+            SlaveryHandshake handshake = SlaveryHandshake_init_default;
             if (pb_decode(&stream, SlaveryHandshake_fields, &handshake)) {             
                 ESP_LOGI(TAG, "Received master MAC address: "MACSTR"", MAC2STR(handshake.master_mac_addr));
                 if (comm_is_peer_exist(handshake.master_mac_addr)) {
                     ESP_LOGI(TAG, "Peer already exists: "MACSTR, MAC2STR(handshake.master_mac_addr));
+
+                    // Continue with time sync with master
+                    start_time_sync(handshake.master_mac_addr);
+
                     return true;
                 }
 
@@ -167,28 +191,9 @@ static bool recv_msg_cb(const CommTask_t* task) {
                     ESP_LOGE(TAG, "Failed to send slave MAC address");
                     return false;
                 }
-                // Stop listening to broadcast
-                comm_remove_peer(COMM_BROADCAST_MAC_ADDR);
 
-                // Continue with syncing time with master
-                ESP_LOGI(TAG, "Requesting master timestamp...");
-                SyncTime time_sync = SyncTime_init_zero;
-                time_sync.message_type = MessageType_SYNC_TIME;
-                buffer_size = 0;
-                if (!pb_get_encoded_size(&buffer_size, SyncTime_fields, &time_sync)) {
-                    ESP_LOGE(TAG, "Failed to get encoded size");
-                    return false;
-                }
-                uint8_t time_sync_buffer[buffer_size];
-                stream = pb_ostream_from_buffer(time_sync_buffer, buffer_size);
-                if (!pb_encode(&stream, SyncTime_fields, &time_sync)) {
-                    ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
-                    return false;
-                }
-
-                sending_timestamp = time(NULL);
-                comm_send(time_sync_buffer, buffer_size, handshake.master_mac_addr);
-
+                // Continue with time sync with master
+                start_time_sync(handshake.master_mac_addr);
             } else {
                 ESP_LOGE(TAG, "Failed to decode SlaveryHandshake: %s", PB_GET_ERROR(&stream));
                 return false;
@@ -196,12 +201,11 @@ static bool recv_msg_cb(const CommTask_t* task) {
             break;
         }
         case MessageType_SYNC_TIME: {
-            SyncTime time_sync = SyncTime_init_zero;
-            time_sync.message_type = MessageType_SYNC_TIME;
+            SyncTime time_sync = SyncTime_init_default;
             if (pb_decode(&stream, SyncTime_fields, &time_sync)) {
                 ESP_LOGI(TAG, "Received master timestamp: %lld", time_sync.master_timestamp);
                 struct timeval tv;
-                tv.tv_sec =  time(NULL) - sending_timestamp + time_sync.master_timestamp;
+                tv.tv_sec =  time(NULL) - s_sending_timestamp + time_sync.master_timestamp;
                 tv.tv_usec = 0;
                 settimeofday(&tv, NULL);
                 ESP_LOGI(TAG, "Slave time is synced with master: %lld", time(NULL));
@@ -267,8 +271,7 @@ void app_main(void)
     // TODO: grab the time
 
     // // Create a sensor query message
-    // SensorQuery query = SensorQuery_init_zero;
-    // query.message_type = MessageType_SENSOR_QUERY;
+    // SensorQuery query = SensorQuery_init_default;
     // query.sensor_type = SensorType_AIR_SENSOR;
     // // If you need to set the body (optional)
     // query.which_body = SensorQuery_air_sensor_tag;
