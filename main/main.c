@@ -19,7 +19,11 @@
 
 static const char *TAG = "Mist";
 
-void nvs_init() {
+// Task handle to notify when slave has sent over its the address
+static TaskHandle_t s_handshake_notify = NULL;
+
+void nvs_init() 
+{
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -29,7 +33,8 @@ void nvs_init() {
     ESP_ERROR_CHECK(ret);
 }
 
-static void handle_sensor_query(const SensorQuery* query) {
+static void handle_sensor_query(const SensorQuery* query) 
+{
     switch (query->sensor_type) {
         case SensorType_MIST_SENSOR:
             // ESP_LOGI(TAG, "Received MIST_SENSOR query, timestamp: %lld", 
@@ -54,7 +59,8 @@ static void handle_sensor_query(const SensorQuery* query) {
     }
 }
 
-static void handle_command(const Command* cmd) {
+static void handle_command(const Command* cmd) 
+{
     ESP_LOGI(TAG, "Received command with ID: %lld", cmd->id);
     
     switch (cmd->which_body) {
@@ -74,8 +80,9 @@ static void handle_command(const Command* cmd) {
 static int64_t s_sending_timestamp = 0;
 
 // Start time sync with master
-static esp_err_t start_time_sync(const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN]) {
-    ESP_LOGI(TAG, "Requesting master timestamp...");
+static esp_err_t start_time_sync(const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN]) 
+{
+    ESP_LOGI(TAG, "Requesting master timestamp... "MACSTR"", MAC2STR(master_mac_addr));
     SyncTime time_sync = SyncTime_init_default;
     size_t buffer_size = 0;
     if (!pb_get_encoded_size(&buffer_size, SyncTime_fields, &time_sync)) {
@@ -93,7 +100,8 @@ static esp_err_t start_time_sync(const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN]
     return comm_send(buffer, buffer_size, master_mac_addr);
 }
 
-static bool recv_msg_cb(const CommTask_t* task) {
+static esp_err_t recv_msg_cb(const CommTask_t* task) 
+{
     pb_istream_t stream = pb_istream_from_buffer(task->buffer, task->buffer_size);
     
     // In Protocol Buffers, each field is prefixed with a tag that contains two pieces of information:
@@ -103,13 +111,13 @@ static bool recv_msg_cb(const CommTask_t* task) {
     uint32_t tag;
     if (!pb_decode_varint32(&stream, &tag)) {
         ESP_LOGE(TAG, "Failed to decode message type");
-        return false; // or handle error
+        return ESP_FAIL;
     }
 
     // Decode the actual message type
     MessageType message_type;
     if (!pb_decode_varint32(&stream, (uint32_t*)&message_type)) {
-        return false; // or handle error
+        return ESP_FAIL;
     }
 
     // In order to decode the message using the correct message type, we need to reset the stream. 
@@ -135,27 +143,23 @@ static bool recv_msg_cb(const CommTask_t* task) {
                 handle_command(&cmd);
             } else {
                 ESP_LOGE(TAG, "Failed to decode command: %s", PB_GET_ERROR(&stream));
-                return false;
+                return ESP_FAIL;
             }
             break;
         }
-        // Received master MAC address from broadcast
+        // Sensor will always listen to broadcast message.
+        // When received master MAC address from broadcast, start the handshake
         case MessageType_SLAVERY_HANDSHAKE: {
             SlaveryHandshake handshake = SlaveryHandshake_init_default;
             if (pb_decode(&stream, SlaveryHandshake_fields, &handshake)) {             
                 ESP_LOGI(TAG, "Received master MAC address: "MACSTR"", MAC2STR(handshake.master_mac_addr));
-                if (comm_is_peer_exist(handshake.master_mac_addr)) {
+                if (!comm_is_peer_exist(handshake.master_mac_addr)) {
+                    if (comm_add_peer(handshake.master_mac_addr, false) != ESP_OK) {
+                        ESP_LOGE(TAG, "Add peer failed");
+                        return ESP_FAIL;
+                    }
+                } else {
                     ESP_LOGI(TAG, "Peer already exists: "MACSTR, MAC2STR(handshake.master_mac_addr));
-
-                    // Continue with time sync with master
-                    start_time_sync(handshake.master_mac_addr);
-
-                    return true;
-                }
-
-                if (comm_add_peer(handshake.master_mac_addr, false) != ESP_OK) {
-                    ESP_LOGE(TAG, "Add peer failed");
-                    return false;
                 }
 
                 // Get sensor mac address
@@ -163,40 +167,43 @@ static bool recv_msg_cb(const CommTask_t* task) {
                 esp_err_t ret = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
                 if (ret != ESP_OK) {
                     ESP_LOGE(TAG, "Get MAC address failed");
-                    return false;
+                    return ESP_FAIL;
                 }
 
                 // Encode slave's address message
                 // Remove master mac address, no need to send it
-                handshake.has_master_mac_addr = false;
+                handshake.has_master_mac_addr = true;
                 handshake.has_slave_mac_addr = true;
                 memcpy(handshake.slave_mac_addr, mac, ESP_NOW_ETH_ALEN);
                 size_t buffer_size = 0;
                 if (!pb_get_encoded_size(&buffer_size, SlaveryHandshake_fields, &handshake)) {
                     ESP_LOGE(TAG, "Get encoded size failed");
-                    return false;
+                    return ESP_FAIL;
                 }
                 uint8_t buffer[buffer_size];
                 pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
                 bool status = pb_encode(&stream, SlaveryHandshake_fields, &handshake);
                 if (!status) {
                     ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
-                    return false;
+                    return ESP_FAIL;
                 }
 
                 // Send back to master
-                ESP_LOGI(TAG, "Sending slave MAC address to master...");
+                ESP_LOGI(TAG, "Sending slave MAC address to master... "MACSTR"", MAC2STR(handshake.master_mac_addr));
                 esp_err_t result = comm_send(buffer, buffer_size, handshake.master_mac_addr);
                 if (result != ESP_OK) {
                     ESP_LOGE(TAG, "Failed to send slave MAC address");
-                    return false;
+                    return ESP_FAIL;
                 }
 
                 // Continue with time sync with master
                 start_time_sync(handshake.master_mac_addr);
+
+                // Handshake is done, notify the main task to unblock
+                xTaskNotifyGive(s_handshake_notify);
             } else {
                 ESP_LOGE(TAG, "Failed to decode SlaveryHandshake: %s", PB_GET_ERROR(&stream));
-                return false;
+                return ESP_FAIL;
             }
             break;
         }
@@ -211,16 +218,57 @@ static bool recv_msg_cb(const CommTask_t* task) {
                 ESP_LOGI(TAG, "Slave time is synced with master: %lld", time(NULL));
             } else {
                 ESP_LOGE(TAG, "Decode SyncTime failed: %s", PB_GET_ERROR(&stream));
-                return false;
+                return ESP_FAIL;
             }
             break;
         }
         default:
             ESP_LOGE(TAG, "Unknown message type: %d", message_type);
-            return false;
+            return ESP_FAIL;
     }
 
-    return true;
+    return ESP_OK;
+}
+
+
+void start_sensor() 
+{
+    while(true) {
+        ESP_LOGI(TAG, "Sending sensor data...");
+
+        // Dummy sensor data
+        SensorQuery query = SensorQuery_init_default;
+        // Specify the the correct sensor type, so buffer size can be calculated correctly
+        query.which_body = SensorQuery_mist_sensor_tag;
+        query.body.mist_sensor.timestamp = time(NULL);
+        query.body.mist_sensor.humidity = (float)(rand() % 101);
+        query.body.mist_sensor.temperature = (float)(rand() % 1001) / 10.0f;
+        
+        size_t buffer_size = 0;
+        if (!pb_get_encoded_size(&buffer_size, SensorQuery_fields, &query)) {
+            ESP_LOGE(TAG, "Failed to get encoded size");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Encoded size: %d", buffer_size);
+
+        uint8_t buffer[buffer_size];
+        pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
+        if (!pb_encode(&stream, SensorQuery_fields, &query)) {
+            ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
+            continue;
+        }
+
+        // Sends out the sensor data to all peers, excluding the broadcast address
+        ESP_LOGI(TAG, "Sent sensor data to all peers");
+        esp_err_t result = comm_send(buffer, buffer_size, NULL);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to send sensor data to peer: %s", esp_err_to_name(result));
+            continue;
+        }
+
+        vTaskDelay(10000 / portTICK_PERIOD_MS);
+    }
 }
 
 void app_main(void)
@@ -233,7 +281,6 @@ void app_main(void)
     comm_init();
     comm_add_peer(COMM_BROADCAST_MAC_ADDR, false);
     comm_register_recv_msg_cb(recv_msg_cb);
-
 
     // Get current time
     time_t now;
@@ -248,66 +295,18 @@ void app_main(void)
     ESP_LOGI(TAG, "  Local time:     %s", ctime(&now));
 
 
+    // Store the handle of the current handshake task
+    s_handshake_notify = xTaskGetCurrentTaskHandle();
+    // Block until the handshake is done
+    while(!ulTaskNotifyTake(pdTRUE, 1000 / portTICK_PERIOD_MS)) {
+        ESP_LOGI(TAG, "Waiting for handshake...");
+    }
+
+    ESP_LOGI(TAG, "Handshake done");
+    xTaskCreate(start_sensor, "start_sensor", 4096, NULL, 5, NULL);
 
     // Dummy main loop
     while (1) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
-
-    // // Broadcast sensor mac address
-    // uint8_t mac[6];
-    // esp_err_t ret = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
-    // if (ret != ESP_OK) {
-    //     ESP_LOGE(TAG, "Failed to get MAC address");
-    //     return;
-    // }
-    // // Broadcast the MAC address for 60 seconds
-    // for(uint i = 0; i < 60; i++) {
-    //     ESP_LOGI(TAG, "Broadcasting MAC address...");
-    //     broadcast(mac, ESP_NOW_ETH_ALEN);
-    //     vTaskDelay(1000 / portTICK_PERIOD_MS);
-    // }
-
-    // TODO: grab the time
-
-    // // Create a sensor query message
-    // SensorQuery query = SensorQuery_init_default;
-    // query.sensor_type = SensorType_AIR_SENSOR;
-    // // If you need to set the body (optional)
-    // query.which_body = SensorQuery_air_sensor_tag;
-    // query.body.air_sensor.sensor_type = SensorType_AIR_SENSOR;
-    // query.body.air_sensor.timestamp = time(NULL);
-    // query.body.air_sensor.humidity = 0.5;
-    // query.body.air_sensor.temperature = 20;
-    // query.body.air_sensor.pressure = 1013.25;
-    // memcpy(query.body.air_sensor.mac_addr, COMM_BROADCAST_MAC_ADDR, ESP_NOW_ETH_ALEN);
-
-    // // Log the sensor query message
-    // ESP_LOGI(TAG, "Sensor query message created:");
-    // ESP_LOGI(TAG, "  Message type: %d", query.message_type);
-    // ESP_LOGI(TAG, "  Sensor type:  %d", query.sensor_type);
-
-    // // Create output buffer for encoding
-    // size_t buffer_size = 0;
-    // if (!pb_get_encoded_size(&buffer_size, SensorQuery_fields, &query)) {
-    //     ESP_LOGE(TAG, "Failed to get encoded size");
-    //     return;
-    // }
-    // uint8_t buffer[buffer_size];
-
-    // // Create stream for encoding
-    // pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
-    // // Encode the message
-    // bool status = pb_encode(&stream, SensorQuery_fields, &query);
-    // if (!status) {
-    //     ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
-    //     return;
-    // }
-
-    // // Broadcast the encoded message
-    // esp_err_t result = broadcast(buffer, buffer_size);
-    // if (result != ESP_OK) {
-    //     ESP_LOGE(TAG, "Failed to broadcast message");
-    //     return;
-    // }
 }
