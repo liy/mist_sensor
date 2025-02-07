@@ -1,6 +1,6 @@
 {
   "idf.openOcdConfigs": ["board/esp32c6-builtin.cfg"],
-  "idf.port": "/dev/tty.usbmodem101",
+  "idf.port": "/dev/tty.usbmodem2101",
   "idf.flashType": "UART",
   "idf.espIdfPath": "/Users/liy/esp/esp-idf",
   "idf.toolsPath": "/Users/liy/.espressif"

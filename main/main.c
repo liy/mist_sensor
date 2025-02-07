@@ -6,6 +6,9 @@
 #include <freertos/task.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <esp_mac.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "pb_encode.h"
 #include "pb_decode.h"
@@ -13,9 +16,6 @@
 #include "wireless.h"
 
 #include "comm.h"
-
-#define WIFI_SSID      "lijilin_2.4G"
-#define WIFI_PASS      "lijilinlijilin"
 
 static const char *TAG = "Mist";
 
@@ -58,13 +58,6 @@ static void handle_command(const Command* cmd) {
     ESP_LOGI(TAG, "Received command with ID: %lld", cmd->id);
     
     switch (cmd->which_body) {
-        case Command_time_sync_tag:
-            if (cmd->body.time_sync.has_timestamp) {
-                ESP_LOGI(TAG, "Time sync command with timestamp: %lld", 
-                         cmd->body.time_sync.timestamp);
-            }
-            break;
-            
         case Command_sleep_cycle_tag:
             ESP_LOGI(TAG, "Sleep cycle command with duration: %lld", 
                      cmd->body.sleep_cycle.sleep_time);
@@ -76,7 +69,10 @@ static void handle_command(const Command* cmd) {
     }
 }
 
-static bool task_handler(const task_t* task) {
+static bool recv_msg_cb(const CommTask_t* task) {
+    // For time sync
+    static int64_t sending_timestamp = 0;
+    
     pb_istream_t stream = pb_istream_from_buffer(task->buffer, task->buffer_size);
     
     // In Protocol Buffers, each field is prefixed with a tag that contains two pieces of information:
@@ -122,7 +118,99 @@ static bool task_handler(const task_t* task) {
             }
             break;
         }
-        
+        // Received master MAC address from broadcast
+        case MessageType_SLAVERY_HANDSHAKE: {
+            SlaveryHandshake handshake = SlaveryHandshake_init_zero;
+            handshake.message_type = MessageType_SLAVERY_HANDSHAKE;
+            if (pb_decode(&stream, SlaveryHandshake_fields, &handshake)) {             
+                ESP_LOGI(TAG, "Received master MAC address: "MACSTR"", MAC2STR(handshake.master_mac_addr));
+                if (comm_is_peer_exist(handshake.master_mac_addr)) {
+                    ESP_LOGI(TAG, "Peer already exists: "MACSTR, MAC2STR(handshake.master_mac_addr));
+                    return true;
+                }
+
+                if (comm_add_peer(handshake.master_mac_addr, false) != ESP_OK) {
+                    ESP_LOGE(TAG, "Add peer failed");
+                    return false;
+                }
+
+                // Get sensor mac address
+                uint8_t mac[6];
+                esp_err_t ret = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "Get MAC address failed");
+                    return false;
+                }
+
+                // Encode slave's address message
+                // Remove master mac address, no need to send it
+                handshake.has_master_mac_addr = false;
+                handshake.has_slave_mac_addr = true;
+                memcpy(handshake.slave_mac_addr, mac, ESP_NOW_ETH_ALEN);
+                size_t buffer_size = 0;
+                if (!pb_get_encoded_size(&buffer_size, SlaveryHandshake_fields, &handshake)) {
+                    ESP_LOGE(TAG, "Get encoded size failed");
+                    return false;
+                }
+                uint8_t buffer[buffer_size];
+                pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
+                bool status = pb_encode(&stream, SlaveryHandshake_fields, &handshake);
+                if (!status) {
+                    ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
+                    return false;
+                }
+
+                // Send back to master
+                ESP_LOGI(TAG, "Sending slave MAC address to master...");
+                esp_err_t result = comm_send(buffer, buffer_size, handshake.master_mac_addr);
+                if (result != ESP_OK) {
+                    ESP_LOGE(TAG, "Failed to send slave MAC address");
+                    return false;
+                }
+                // Stop listening to broadcast
+                comm_remove_peer(COMM_BROADCAST_MAC_ADDR);
+
+                // Continue with syncing time with master
+                ESP_LOGI(TAG, "Requesting master timestamp...");
+                SyncTime time_sync = SyncTime_init_zero;
+                time_sync.message_type = MessageType_SYNC_TIME;
+                buffer_size = 0;
+                if (!pb_get_encoded_size(&buffer_size, SyncTime_fields, &time_sync)) {
+                    ESP_LOGE(TAG, "Failed to get encoded size");
+                    return false;
+                }
+                uint8_t time_sync_buffer[buffer_size];
+                stream = pb_ostream_from_buffer(time_sync_buffer, buffer_size);
+                if (!pb_encode(&stream, SyncTime_fields, &time_sync)) {
+                    ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
+                    return false;
+                }
+
+                sending_timestamp = time(NULL);
+                comm_send(time_sync_buffer, buffer_size, handshake.master_mac_addr);
+
+            } else {
+                ESP_LOGE(TAG, "Failed to decode SlaveryHandshake: %s", PB_GET_ERROR(&stream));
+                return false;
+            }
+            break;
+        }
+        case MessageType_SYNC_TIME: {
+            SyncTime time_sync = SyncTime_init_zero;
+            time_sync.message_type = MessageType_SYNC_TIME;
+            if (pb_decode(&stream, SyncTime_fields, &time_sync)) {
+                ESP_LOGI(TAG, "Received master timestamp: %lld", time_sync.master_timestamp);
+                struct timeval tv;
+                tv.tv_sec =  time(NULL) - sending_timestamp + time_sync.master_timestamp;
+                tv.tv_usec = 0;
+                settimeofday(&tv, NULL);
+                ESP_LOGI(TAG, "Slave time is synced with master: %lld", time(NULL));
+            } else {
+                ESP_LOGE(TAG, "Decode SyncTime failed: %s", PB_GET_ERROR(&stream));
+                return false;
+            }
+            break;
+        }
         default:
             ESP_LOGE(TAG, "Unknown message type: %d", message_type);
             return false;
@@ -136,11 +224,11 @@ void app_main(void)
     // Initialize NVS for wifi station mode
     nvs_init();
     // Swith WiFi to ESPNOW mode
-    wifi_espnow_init();
+    wl_wifi_espnow_init();
     // Initialize ESPNOW
     comm_init();
-    add_peer(BROADCAST_MAC_ADDR, false);
-    register_message_handler(task_handler);
+    comm_add_peer(COMM_BROADCAST_MAC_ADDR, false);
+    comm_register_recv_msg_cb(recv_msg_cb);
 
 
     // Get current time
@@ -155,19 +243,26 @@ void app_main(void)
     ESP_LOGI(TAG, "  UTC time:       %s", asctime(&timeinfo));
     ESP_LOGI(TAG, "  Local time:     %s", ctime(&now));
 
-    // Broadcast sensor mac address
-    uint8_t mac[6];
-    esp_err_t ret = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get MAC address");
-        return;
-    }
-    // Broadcast the MAC address for 60 seconds
-    for(uint i = 0; i < 60; i++) {
-        ESP_LOGI(TAG, "Broadcasting MAC address...");
-        broadcast(mac, ESP_NOW_ETH_ALEN);
+
+
+    // Dummy main loop
+    while (1) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
+
+    // // Broadcast sensor mac address
+    // uint8_t mac[6];
+    // esp_err_t ret = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
+    // if (ret != ESP_OK) {
+    //     ESP_LOGE(TAG, "Failed to get MAC address");
+    //     return;
+    // }
+    // // Broadcast the MAC address for 60 seconds
+    // for(uint i = 0; i < 60; i++) {
+    //     ESP_LOGI(TAG, "Broadcasting MAC address...");
+    //     broadcast(mac, ESP_NOW_ETH_ALEN);
+    //     vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // }
 
     // TODO: grab the time
 
@@ -182,7 +277,7 @@ void app_main(void)
     // query.body.air_sensor.humidity = 0.5;
     // query.body.air_sensor.temperature = 20;
     // query.body.air_sensor.pressure = 1013.25;
-    // memcpy(query.body.air_sensor.mac_addr, BROADCAST_MAC_ADDR, ESP_NOW_ETH_ALEN);
+    // memcpy(query.body.air_sensor.mac_addr, COMM_BROADCAST_MAC_ADDR, ESP_NOW_ETH_ALEN);
 
     // // Log the sensor query message
     // ESP_LOGI(TAG, "Sensor query message created:");
