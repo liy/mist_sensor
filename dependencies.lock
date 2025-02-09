@@ -27,6 +27,6 @@ direct_dependencies:
 - espressif/led_strip
 - idf
 - pedrominatel/sht4x
-manifest_hash: d2cfcaa11352126c3cf5a167b795e4c79fb6e4100d8c3ae1b4774fc9256a15af
+manifest_hash: 3c6ba652efbf4fd5d7a4d39eabc6b0a1b9b209e6aeab934e4b595ec39e1d2722
 target: esp32c6
 version: 2.0.0
