@@ -299,6 +299,7 @@ void start_sensor()
             continue;
         }
 
+        led_action();
         vTaskDelay(10000 / portTICK_PERIOD_MS);
     }
 }
