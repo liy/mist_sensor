@@ -13,7 +13,6 @@
 #include "pb_encode.h"
 #include "pb_decode.h"
 #include "messages.pb.h"
-#include "wireless.h"
 
 #include "comm.h"
 #include "sht4x.h"
@@ -303,13 +302,30 @@ void start_sensor()
     }
 }
 
+static void init_wifi() {
+    ESP_LOGI(TAG, "WiFi ESPNOW mode initialization starting...");
+    ESP_ERROR_CHECK(esp_netif_init());
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg) );
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    // Commented out. When switching from station mode to ESPNOW mode, the channel is preserved.
+    // The AP or router might have capability to detect channel with less traffic.
+    // Therefore would be benificial to ESPNOW mode to stick to the same channel.
+    // ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+    // Enable long range mode
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR));
+}
+
 void app_main(void)
 {
     // Initialize NVS for wifi station mode
     nvs_init();
-    // Swith WiFi to ESPNOW mode
-    wl_wifi_espnow_init();
-    // Initialize ESPNOW
+    // Initialize wifi
+    init_wifi();
+    // Initialize communication using wifi espnow 
     comm_init();
     comm_add_peer(COMM_BROADCAST_MAC_ADDR, false);
     comm_register_recv_msg_cb(recv_msg_cb);
