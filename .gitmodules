@@ -7,3 +7,6 @@
 [submodule "components/mist_wireless"]
 	path = components/mist_wireless
 	url = git@github.com:liy/mist_wireless.git
+[submodule "components/sed"]
+	path = components/sed
+	url = git@github.com:liy/sed.git

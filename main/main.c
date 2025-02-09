@@ -13,8 +13,9 @@
 #include "pb_encode.h"
 #include "pb_decode.h"
 #include "messages.pb.h"
-
 #include "comm.h"
+#include "led.h"
+
 #include "sht4x.h"
 
 
@@ -321,6 +322,8 @@ static void init_wifi() {
 
 void app_main(void)
 {
+    led_blink();
+
     // Initialize NVS for wifi station mode
     nvs_init();
     // Initialize wifi
@@ -351,6 +354,7 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "Handshake done");
 
+    led_off();
 
     // Initialize I2C bus
     i2c_master_bus_handle_t bus_handle = i2c_bus_init(SHT4X_SDA_GPIO, SHT4X_SCL_GPIO);
