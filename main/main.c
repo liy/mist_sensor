@@ -126,6 +126,16 @@ static esp_err_t start_time_sync(const uint8_t master_mac_addr[ESP_NOW_ETH_ALEN]
     return comm_send(buffer, buffer_size, master_mac_addr);
 }
 
+static esp_err_t send_msg_cb(const uint8_t* mac_addr, esp_now_send_status_t status) 
+{
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        led_action();
+    } else {
+        led_fail();
+    }
+    return ESP_OK;
+}
+
 static esp_err_t recv_msg_cb(const CommTask_t* task) 
 {
     pb_istream_t stream = pb_istream_from_buffer(task->buffer, task->buffer_size);
@@ -267,6 +277,10 @@ void start_sensor()
         esp_err_t err = sht4x_start_measurement(sht4x_handle, SHT4X_CMD_READ_MEASUREMENT_HIGH);
         vTaskDelay(pdMS_TO_TICKS(50));
         err = sht4x_read_measurement(sht4x_handle, &temperature, &humidity);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read sensor data");
+            continue;
+        }
 
         // Dummy sensor data
         SensorQuery query = SensorQuery_init_default;
@@ -299,8 +313,7 @@ void start_sensor()
             continue;
         }
 
-        led_action();
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
+        vTaskDelay(3000 / portTICK_PERIOD_MS);
     }
 }
 
@@ -312,13 +325,9 @@ static void init_wifi() {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    // Commented out. When switching from station mode to ESPNOW mode, the channel is preserved.
-    // The AP or router might have capability to detect channel with less traffic.
-    // Therefore would be benificial to ESPNOW mode to stick to the same channel.
-    // ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
-
+    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
     // Enable long range mode
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(ESPNOW_WIFI_IF, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR));
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR));
 }
 
 void app_main(void)
@@ -333,6 +342,7 @@ void app_main(void)
     comm_init();
     comm_add_peer(COMM_BROADCAST_MAC_ADDR, false);
     comm_register_recv_msg_cb(recv_msg_cb);
+    comm_register_send_msg_cb(send_msg_cb);
 
     // Get current time
     time_t now;
