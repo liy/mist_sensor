@@ -29,6 +29,9 @@ static const char *TAG = "Mist";
 // Task handle to notify when slave has sent over its the address
 static TaskHandle_t s_handshake_notify = NULL;
 
+// The default sample rate, in milliseconds
+static uint64_t s_sample_rate = 5000;
+
 i2c_master_bus_handle_t i2c_bus_init(uint8_t sda_io, uint8_t scl_io)
 {
     i2c_master_bus_config_t i2c_bus_config = {
@@ -85,16 +88,24 @@ static void handle_sensor_query(const SensorQuery* query)
     }
 }
 
-static void handle_command(const Command* cmd) 
+static void handle_sensor_command(const SensorCommand* cmd) 
 {
     ESP_LOGI(TAG, "Received command with ID: %lld", cmd->id);
     
     switch (cmd->which_body) {
-        case Command_sleep_cycle_tag:
+        case SensorCommand_sleep_cycle_tag:
             ESP_LOGI(TAG, "Sleep cycle command with duration: %lld", 
                      cmd->body.sleep_cycle.sleep_time);
             break;
-            
+        case SensorCommand_sample_rate_tag:
+            ESP_LOGI(TAG, "Sample rate command with rate: %lld", 
+                     cmd->body.sample_rate.rate);
+            if(cmd->body.sample_rate.rate < 500) {
+                ESP_LOGE(TAG, "Sample rate cannot be less than 500ms");
+                break;
+            }
+            s_sample_rate = cmd->body.sample_rate.rate;
+            break;    
         default:
             ESP_LOGE(TAG, "Unknown command body type");
             break;
@@ -173,10 +184,10 @@ static esp_err_t recv_msg_cb(const CommTask_t* task)
             }
             break;
         }
-        case MessageType_COMMAND: {
-            Command cmd = Command_init_default;
-            if (pb_decode(&stream, &Command_msg, &cmd)) {
-                handle_command(&cmd);
+        case MessageType_SENSOR_COMMAND: {
+            SensorCommand cmd = SensorCommand_init_default;
+            if (pb_decode(&stream, &SensorCommand_msg, &cmd)) {
+                handle_sensor_command(&cmd);
             } else {
                 ESP_LOGE(TAG, "Failed to decode command: %s", PB_GET_ERROR(&stream));
                 return ESP_FAIL;
@@ -313,7 +324,7 @@ void start_sensor()
             continue;
         }
 
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        vTaskDelay(s_sample_rate / portTICK_PERIOD_MS);
     }
 }
 
@@ -323,6 +334,7 @@ static void init_wifi() {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg) );
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    // Sensor is a client, so station mode is used
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE));
