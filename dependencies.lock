@@ -13,20 +13,9 @@ dependencies:
     source:
       type: idf
     version: 5.5.0
-  pedrominatel/sht4x:
-    component_hash: fc682c147c863752218b81557a2c75d484f2e39c5f8709943e36068a954fb8e4
-    dependencies:
-    - name: idf
-      require: private
-      version: '>=5.3'
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.1.1
 direct_dependencies:
 - espressif/led_strip
 - idf
-- pedrominatel/sht4x
-manifest_hash: 3c6ba652efbf4fd5d7a4d39eabc6b0a1b9b209e6aeab934e4b595ec39e1d2722
+manifest_hash: 9f04b72142aa7d2353ddfc4991a875d3cf56ce0cce67ac76bde7422ea19465e3
 target: esp32c6
 version: 2.0.0

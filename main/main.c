@@ -10,19 +10,17 @@
 #include <time.h>
 #include <sys/time.h>
 
+#include <sht4x.h>
+#include <sgp40.h>
+
 #include "pb_encode.h"
 #include "pb_decode.h"
 #include "messages.pb.h"
 #include "comm.h"
 #include "led.h"
 
-#include "sht4x.h"
-
-
-#define SHT4X_SDA_GPIO      GPIO_NUM_6  /*!< gpio number for I2C master data  */
-#define SHT4X_SCL_GPIO      GPIO_NUM_7  /*!< gpio number for I2C master clock */
-
-i2c_master_dev_handle_t sht4x_handle;
+#define I2C_SDA_GPIO      GPIO_NUM_6  /*!< gpio number for I2C master data  */
+#define I2C_SCL_GPIO      GPIO_NUM_7  /*!< gpio number for I2C master clock */
 
 static const char *TAG = "Mist";
 
@@ -30,26 +28,7 @@ static const char *TAG = "Mist";
 static TaskHandle_t s_handshake_notify = NULL;
 
 // The default sample rate, in milliseconds
-static uint64_t s_sample_rate = 5000;
-
-i2c_master_bus_handle_t i2c_bus_init(uint8_t sda_io, uint8_t scl_io)
-{
-    i2c_master_bus_config_t i2c_bus_config = {
-        .i2c_port = CONFIG_SHT4X_I2C_NUM,
-        .sda_io_num = sda_io,
-        .scl_io_num = scl_io,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-
-    i2c_master_bus_handle_t bus_handle;
-
-    ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &bus_handle));
-    ESP_LOGI(TAG, "I2C master bus created");
-
-    return bus_handle;
-}
+static uint64_t s_sample_rate = 2000;
 
 void nvs_init() 
 {
@@ -60,32 +39,6 @@ void nvs_init()
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-}
-
-static void handle_sensor_query(const SensorQuery* query) 
-{
-    switch (query->sensor_type) {
-        case SensorType_MIST_SENSOR:
-            // ESP_LOGI(TAG, "Received MIST_SENSOR query, timestamp: %lld", 
-            //          query->body.mist_sensor.timestamp);
-            ESP_LOGI(TAG, "Received MIST_SENSOR query, timestamp: %lld, humidity: %f, temperature: %f", 
-                     query->body.mist_sensor.timestamp, query->body.mist_sensor.humidity, query->body.mist_sensor.temperature);
-            break;
-            
-        case SensorType_AIR_SENSOR:
-            ESP_LOGI(TAG, "Received AIR_SENSOR query, timestamp: %lld, humidity: %f, temperature: %f", 
-                     query->body.air_sensor.timestamp, query->body.air_sensor.humidity, query->body.air_sensor.temperature);
-            break;
-            
-        case SensorType_LIGHT_SENSOR:
-            ESP_LOGI(TAG, "Received LIGHT_SENSOR query, timestamp: %lld, light intensity: %f", 
-                     query->body.light_sensor.timestamp, query->body.light_sensor.intensity);
-            break;
-            
-        default:
-            ESP_LOGE(TAG, "Unknown sensor type: %d", query->sensor_type);
-            break;
-    }
 }
 
 static void handle_sensor_command(const SensorCommand* cmd) 
@@ -101,7 +54,7 @@ static void handle_sensor_command(const SensorCommand* cmd)
             ESP_LOGI(TAG, "Sample rate command with rate: %lld", 
                      cmd->body.sample_rate.rate);
             if(cmd->body.sample_rate.rate < 500) {
-                ESP_LOGE(TAG, "Sample rate cannot be less than 500ms");
+                ESP_LOGE(TAG, "Sample rate cannot be less than 50ms");
                 break;
             }
             s_sample_rate = cmd->body.sample_rate.rate;
@@ -174,16 +127,6 @@ static esp_err_t recv_msg_cb(const CommTask_t* task)
     stream.state = (void*)task->buffer;
 
     switch (message_type) {
-        case MessageType_SENSOR_QUERY: {
-            SensorQuery query = SensorQuery_init_default;
-            if (pb_decode(&stream, SensorQuery_fields, &query)) {
-                handle_sensor_query(&query);
-            } else {
-                ESP_LOGE(TAG, "Failed to decode SensorQuery: %s", PB_GET_ERROR(&stream));
-                return false;
-            }
-            break;
-        }
         case MessageType_SENSOR_COMMAND: {
             SensorCommand cmd = SensorCommand_init_default;
             if (pb_decode(&stream, &SensorCommand_msg, &cmd)) {
@@ -277,57 +220,6 @@ static esp_err_t recv_msg_cb(const CommTask_t* task)
     return ESP_OK;
 }
 
-
-void start_sensor() 
-{
-    float temperature, humidity;
-    
-    while(true) {
-        ESP_LOGI(TAG, "Sending sensor data...");
-
-        esp_err_t err = sht4x_start_measurement(sht4x_handle, SHT4X_CMD_READ_MEASUREMENT_HIGH);
-        vTaskDelay(pdMS_TO_TICKS(50));
-        err = sht4x_read_measurement(sht4x_handle, &temperature, &humidity);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to read sensor data");
-            continue;
-        }
-
-        // Dummy sensor data
-        SensorQuery query = SensorQuery_init_default;
-        // Specify the the correct sensor type, so buffer size can be calculated correctly
-        query.which_body = SensorQuery_mist_sensor_tag;
-        query.body.mist_sensor.timestamp = time(NULL);
-        query.body.mist_sensor.humidity = humidity;
-        query.body.mist_sensor.temperature = temperature;
-
-        size_t buffer_size = 0;
-        if (!pb_get_encoded_size(&buffer_size, SensorQuery_fields, &query)) {
-            ESP_LOGE(TAG, "Failed to get encoded size");
-            continue;
-        }
-
-        ESP_LOGI(TAG, "Encoded size: %d", buffer_size);
-
-        uint8_t buffer[buffer_size];
-        pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
-        if (!pb_encode(&stream, SensorQuery_fields, &query)) {
-            ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
-            continue;
-        }
-
-        // Sends out the sensor data to all peers, excluding the broadcast address
-        ESP_LOGI(TAG, "Sent sensor data to all peers");
-        esp_err_t result = comm_send(buffer, buffer_size, NULL);
-        if (result != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send sensor data to peer: %s", esp_err_to_name(result));
-            continue;
-        }
-
-        vTaskDelay(s_sample_rate / portTICK_PERIOD_MS);
-    }
-}
-
 static void init_wifi() {
     ESP_LOGI(TAG, "WiFi ESPNOW mode initialization starting...");
     ESP_ERROR_CHECK(esp_netif_init());
@@ -342,10 +234,86 @@ static void init_wifi() {
     ESP_ERROR_CHECK(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR));
 }
 
+static void measure_task()
+{
+    // setup SHT3x
+    sht4x_t sht;
+    memset(&sht, 0, sizeof(sht));
+    ESP_ERROR_CHECK(sht4x_init_desc(&sht, 0, I2C_SDA_GPIO, I2C_SCL_GPIO));
+    ESP_ERROR_CHECK(sht4x_init(&sht));
+    ESP_LOGI(TAG, "Humidity sensor initilalized");
+
+    // setup SGP40
+    sgp40_t sgp;
+    memset(&sgp, 0, sizeof(sgp));
+    ESP_ERROR_CHECK(sgp40_init_desc(&sgp, 0, I2C_SDA_GPIO, I2C_SCL_GPIO));
+    ESP_ERROR_CHECK(sgp40_init(&sgp));
+    ESP_LOGI(TAG, "SGP40 initilalized. Serial: 0x%04x%04x%04x", sgp.serial[0], sgp.serial[1], sgp.serial[2]);
+
+    // Start pre-heating the SGP40 sensor for awhile
+    for (int32_t i=0; i<240; i++) {
+        float temperature, humidity;
+        ESP_ERROR_CHECK(sht4x_measure(&sht, &temperature, &humidity));
+        // Feed it to SGP40
+        int32_t voc_index;
+        ESP_ERROR_CHECK(sgp40_measure_voc(&sgp, 0, 0, &voc_index));
+        ESP_LOGI(TAG, "Preheating %.2f °C, %.2f %%, VOC index: %" PRIi32 "", temperature, humidity, voc_index);
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    TickType_t last_wakeup = xTaskGetTickCount();
+    while (1)
+    {
+        float temperature, humidity;
+        ESP_ERROR_CHECK(sht4x_measure(&sht, &temperature, &humidity));
+        // Feed it to SGP40
+        int32_t voc_index;
+        ESP_ERROR_CHECK(sgp40_measure_voc(&sgp, humidity, temperature, &voc_index));
+        ESP_LOGI(TAG, "%.2f °C, %.2f %%, VOC index: %" PRIi32 "", temperature, humidity, voc_index);
+
+        // Dummy sensor data
+        SensorData data = SensorData_init_default;
+        data.sensor_type = SensorType_AIR_SENSOR;
+        // Specify the the correct sensor type, so buffer size can be calculated correctly
+        data.which_body = SensorData_air_sensor_tag;
+        data.body.air_sensor.timestamp = time(NULL);
+        data.body.air_sensor.humidity = humidity;
+        data.body.air_sensor.temperature = temperature;
+        data.body.air_sensor.voc_index = voc_index;
+
+        size_t buffer_size = 0;
+        if (!pb_get_encoded_size(&buffer_size, SensorData_fields, &data)) {
+            ESP_LOGE(TAG, "Failed to get encoded size");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Encoded size: %d", buffer_size);
+
+        uint8_t buffer[buffer_size];
+        pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
+        if (!pb_encode(&stream, SensorData_fields, &data)) {
+            ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
+            continue;
+        }
+
+        // Sends out the sensor data to all peers, excluding the broadcast address
+        ESP_LOGI(TAG, "Sent sensor data to all peers");
+        esp_err_t result = comm_send(buffer, buffer_size, NULL);
+        if (result != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to send sensor data to peer: %s", esp_err_to_name(result));
+            continue;
+        }
+
+        // Wait until 1 seconds (VOC cycle time) are over.
+        vTaskDelayUntil(&last_wakeup, pdMS_TO_TICKS(s_sample_rate));
+    }
+}
+
 void app_main(void)
 {
     led_blink();
-
+    
     // Initialize NVS for wifi station mode
     nvs_init();
     // Initialize wifi
@@ -379,27 +347,6 @@ void app_main(void)
 
     led_off();
 
-    // Initialize I2C bus
-    i2c_master_bus_handle_t bus_handle = i2c_bus_init(SHT4X_SDA_GPIO, SHT4X_SCL_GPIO);
-    sht4x_handle = sht4x_device_create(bus_handle, SHT4X_I2C_ADDR_0, CONFIG_SHT4X_I2C_CLK_SPEED_HZ);
-    ESP_LOGI(TAG, "Sensor initialization success");
-
-
-    // Probe the sensor to check if it is connected to the bus with a 10ms timeout
-    esp_err_t err = i2c_master_probe(bus_handle, SHT4X_I2C_ADDR_0, 200);
-
-    if(err == ESP_OK) {
-        ESP_LOGI(TAG, "SHT4X sensor found");
-        xTaskCreate(start_sensor, "start_sensor", 4096, NULL, 5, NULL);
-    } else {
-        ESP_LOGE(TAG, "SHT4X sensor not found");
-        sht4x_device_delete(sht4x_handle);
-    }
-
-
-
-    // Dummy main loop
-    while (1) {
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
+    ESP_ERROR_CHECK(i2cdev_init());
+    xTaskCreate(measure_task, "measure_task", 4096, NULL, 5, NULL);
 }
