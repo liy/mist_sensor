@@ -21,8 +21,9 @@
 #include "comm.h"
 #include "led.h"
 
-#define I2C_SDA_GPIO      GPIO_NUM_6  /*!< gpio number for I2C master data  */
-#define I2C_SCL_GPIO      GPIO_NUM_7  /*!< gpio number for I2C master clock */
+#define I2C_SDA_GPIO                    GPIO_NUM_6  /*!< gpio number for I2C master data  */
+#define I2C_SCL_GPIO                    GPIO_NUM_7  /*!< gpio number for I2C master clock */
+#define SOIL_MOISTURE_ADC_CHANNEL       ADC_CHANNEL_0 /*!< ADC channel for soil moisture sensor */
 
 static const char *TAG = "Mist";
 
@@ -329,7 +330,7 @@ static void measure_task()
     ESP_LOGI(TAG, "SGP40 initilalized. Serial: 0x%04x%04x%04x", sgp.serial[0], sgp.serial[1], sgp.serial[2]);
 
     // Start pre-heating the SGP40 sensor for awhile
-    for (int32_t i=0; i<240; i++) {
+    for (int32_t i=0; i<1; i++) {
         float temperature, humidity;
         ESP_ERROR_CHECK(sht4x_measure(&sht, &temperature, &humidity));
         // Feed it to SGP40
@@ -352,11 +353,14 @@ static void measure_task()
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &config));
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, SOIL_MOISTURE_ADC_CHANNEL, &config));
 
     // ADC Calibration
     adc_cali_handle_t adc_cali_handle = NULL;
-    bool calibrated = adc_calibration(ADC_UNIT_1, ADC_CHANNEL_0, ADC_ATTEN_DB_12, &adc_cali_handle);
+    bool calibrated = adc_calibration(ADC_UNIT_1, SOIL_MOISTURE_ADC_CHANNEL, ADC_ATTEN_DB_12, &adc_cali_handle);
+    if (!calibrated) {
+        ESP_LOGE(TAG, "ADC not calibrated, No soil moisture measurement will be taken");
+    }
 
     TickType_t last_wakeup = xTaskGetTickCount();
     while (1)
@@ -366,7 +370,7 @@ static void measure_task()
         // Feed it to SGP40
         int32_t voc_index;
         ESP_ERROR_CHECK(sgp40_measure_voc(&sgp, humidity, temperature, &voc_index));
-        ESP_LOGI(TAG, "%.2f °C, %.2f %%, VOC index: %" PRIi32 "", temperature, humidity, voc_index);
+        ESP_LOGI(TAG, "Air: %.2f °C, %.2f %%, VOC index: %" PRIi32 "", temperature, humidity, voc_index);
 
         // Air sensor data
         SensorData airData = SensorData_init_default;
@@ -381,23 +385,23 @@ static void measure_task()
         send_sensor_data(&airData);
 
         // Measure soil moisture on specific adc channel
-        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &adc_raw));
-        // ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, ADC_CHANNEL_0, adc_raw);
-        float soil_moisture = 0;
         if (calibrated) {
+            ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, SOIL_MOISTURE_ADC_CHANNEL, &adc_raw));
+            float soil_moisture = 0;
             ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &voltage));
-            soil_moisture = fmax(fmin((voltage - 860) / 1240.0, 1.0), 0.0);
+            soil_moisture = fmax(fmin(1.0 - (voltage - 860) / 1240.0, 1.0), 0.0);
+            ESP_LOGI(TAG, "Soil moisture: %.2f", soil_moisture);
+
+            // Soil sensor data
+            SensorData soilData = SensorData_init_default;
+            soilData.sensor_type = SensorType_SOIL_SENSOR;
+            // Specify the the correct sensor type, so buffer size can be calculated correctly
+            soilData.which_body = SensorData_soil_sensor_tag;
+            soilData.body.soil_sensor.timestamp = time(NULL);
+            soilData.body.soil_sensor.moisture = soil_moisture;
+
+            send_sensor_data(&soilData);
         }
-
-        // Soil sensor data
-        SensorData soilData = SensorData_init_default;
-        soilData.sensor_type = SensorType_SOIL_SENSOR;
-        // Specify the the correct sensor type, so buffer size can be calculated correctly
-        soilData.which_body = SensorData_soil_sensor_tag;
-        soilData.body.soil_sensor.timestamp = time(NULL);
-        soilData.body.soil_sensor.moisture = soil_moisture;
-
-        send_sensor_data(&soilData);
 
         // Wait until 1 seconds (VOC cycle time) are over.
         vTaskDelayUntil(&last_wakeup, pdMS_TO_TICKS(s_sample_rate));
