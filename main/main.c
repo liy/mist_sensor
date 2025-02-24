@@ -9,6 +9,8 @@
 #include <esp_mac.h>
 #include <time.h>
 #include <sys/time.h>
+#include "esp_adc/adc_oneshot.h"
+#include <math.h>
 
 #include <sht4x.h>
 #include <sgp40.h>
@@ -29,6 +31,8 @@ static TaskHandle_t s_handshake_notify = NULL;
 
 // The default sample rate, in milliseconds
 static uint64_t s_sample_rate = 2000;
+
+static adc_oneshot_unit_handle_t adc_handle;
 
 void nvs_init() 
 {
@@ -234,6 +238,80 @@ static void init_wifi() {
     ESP_ERROR_CHECK(esp_wifi_set_protocol(ESP_IF_WIFI_STA, WIFI_PROTOCOL_11B|WIFI_PROTOCOL_11G|WIFI_PROTOCOL_11N|WIFI_PROTOCOL_LR));
 }
 
+// ADC Calibration
+static bool adc_calibration(adc_unit_t unit, adc_channel_t channel, adc_atten_t atten, adc_cali_handle_t *out_handle)
+{
+    adc_cali_handle_t handle = NULL;
+    esp_err_t ret = ESP_FAIL;
+    bool calibrated = false;
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    if (!calibrated) {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Curve Fitting");
+        adc_cali_curve_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .chan = channel,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_curve_fitting(&cali_config, &handle);
+        if (ret == ESP_OK) {
+            calibrated = true;
+        }
+    }
+#endif
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    if (!calibrated) {
+        ESP_LOGI(TAG, "calibration scheme version is %s", "Line Fitting");
+        adc_cali_line_fitting_config_t cali_config = {
+            .unit_id = unit,
+            .atten = atten,
+            .bitwidth = ADC_BITWIDTH_DEFAULT,
+        };
+        ret = adc_cali_create_scheme_line_fitting(&cali_config, &handle);
+        if (ret == ESP_OK) {
+            calibrated = true;
+        }
+    }
+#endif
+
+    *out_handle = handle;
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Calibration Success");
+    } else if (ret == ESP_ERR_NOT_SUPPORTED || !calibrated) {
+        ESP_LOGW(TAG, "eFuse not burnt, skip software calibration");
+    } else {
+        ESP_LOGE(TAG, "Invalid arg or no memory");
+    }
+
+    return calibrated;
+}
+
+static void send_sensor_data(const void *src_struct) {
+    size_t buffer_size = 0;
+    if (!pb_get_encoded_size(&buffer_size, SensorData_fields, src_struct)) {
+        ESP_LOGE(TAG, "Failed to get encoded size");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Encoded size: %d", buffer_size);
+
+    uint8_t buffer[buffer_size];
+    pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
+    if (!pb_encode(&stream, SensorData_fields, src_struct)) {
+        ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
+        return;
+    }
+
+    // Sends out the sensor data to all peers, excluding the broadcast address
+    ESP_LOGI(TAG, "Sent sensor data to all peers");
+    esp_err_t result = comm_send(buffer, buffer_size, NULL);
+    if (result != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to send sensor data to peer: %s", esp_err_to_name(result));
+    }
+}
+
 static void measure_task()
 {
     // setup SHT3x
@@ -262,6 +340,24 @@ static void measure_task()
         vTaskDelay(pdMS_TO_TICKS(200));
     }
 
+    // Start soil moisture sensor setup
+    int adc_raw;
+    int voltage;
+    adc_oneshot_unit_init_cfg_t init_config1 = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc_handle));
+
+    adc_oneshot_chan_cfg_t config = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, ADC_CHANNEL_0, &config));
+
+    // ADC Calibration
+    adc_cali_handle_t adc_cali_handle = NULL;
+    bool calibrated = adc_calibration(ADC_UNIT_1, ADC_CHANNEL_0, ADC_ATTEN_DB_12, &adc_cali_handle);
+
     TickType_t last_wakeup = xTaskGetTickCount();
     while (1)
     {
@@ -272,38 +368,36 @@ static void measure_task()
         ESP_ERROR_CHECK(sgp40_measure_voc(&sgp, humidity, temperature, &voc_index));
         ESP_LOGI(TAG, "%.2f °C, %.2f %%, VOC index: %" PRIi32 "", temperature, humidity, voc_index);
 
-        // Dummy sensor data
-        SensorData data = SensorData_init_default;
-        data.sensor_type = SensorType_AIR_SENSOR;
+        // Air sensor data
+        SensorData airData = SensorData_init_default;
+        airData.sensor_type = SensorType_AIR_SENSOR;
         // Specify the the correct sensor type, so buffer size can be calculated correctly
-        data.which_body = SensorData_air_sensor_tag;
-        data.body.air_sensor.timestamp = time(NULL);
-        data.body.air_sensor.humidity = humidity;
-        data.body.air_sensor.temperature = temperature;
-        data.body.air_sensor.voc_index = voc_index;
+        airData.which_body = SensorData_air_sensor_tag;
+        airData.body.air_sensor.timestamp = time(NULL);
+        airData.body.air_sensor.humidity = humidity;
+        airData.body.air_sensor.temperature = temperature;
+        airData.body.air_sensor.voc_index = voc_index;
 
-        size_t buffer_size = 0;
-        if (!pb_get_encoded_size(&buffer_size, SensorData_fields, &data)) {
-            ESP_LOGE(TAG, "Failed to get encoded size");
-            continue;
+        send_sensor_data(&airData);
+
+        // Measure soil moisture on specific adc channel
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, ADC_CHANNEL_0, &adc_raw));
+        // ESP_LOGI(TAG, "ADC%d Channel[%d] Raw Data: %d", ADC_UNIT_1 + 1, ADC_CHANNEL_0, adc_raw);
+        float soil_moisture = 0;
+        if (calibrated) {
+            ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &voltage));
+            soil_moisture = fmax(fmin((voltage - 860) / 1240.0, 1.0), 0.0);
         }
 
-        ESP_LOGI(TAG, "Encoded size: %d", buffer_size);
+        // Soil sensor data
+        SensorData soilData = SensorData_init_default;
+        soilData.sensor_type = SensorType_SOIL_SENSOR;
+        // Specify the the correct sensor type, so buffer size can be calculated correctly
+        soilData.which_body = SensorData_soil_sensor_tag;
+        soilData.body.soil_sensor.timestamp = time(NULL);
+        soilData.body.soil_sensor.moisture = soil_moisture;
 
-        uint8_t buffer[buffer_size];
-        pb_ostream_t stream = pb_ostream_from_buffer(buffer, buffer_size);
-        if (!pb_encode(&stream, SensorData_fields, &data)) {
-            ESP_LOGE(TAG, "Encoding failed: %s", PB_GET_ERROR(&stream));
-            continue;
-        }
-
-        // Sends out the sensor data to all peers, excluding the broadcast address
-        ESP_LOGI(TAG, "Sent sensor data to all peers");
-        esp_err_t result = comm_send(buffer, buffer_size, NULL);
-        if (result != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to send sensor data to peer: %s", esp_err_to_name(result));
-            continue;
-        }
+        send_sensor_data(&soilData);
 
         // Wait until 1 seconds (VOC cycle time) are over.
         vTaskDelayUntil(&last_wakeup, pdMS_TO_TICKS(s_sample_rate));
@@ -335,7 +429,6 @@ void app_main(void)
     ESP_LOGI(TAG, "  Unix timestamp: %lld", (long long)now);
     ESP_LOGI(TAG, "  UTC time:       %s", asctime(&timeinfo));
     ESP_LOGI(TAG, "  Local time:     %s", ctime(&now));
-
 
     // Store the handle of the current handshake task
     s_handshake_notify = xTaskGetCurrentTaskHandle();
